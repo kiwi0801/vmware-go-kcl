@@ -28,12 +28,11 @@
 package worker
 
 import (
-	"math"
+	"context"
 	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/service/kinesis"
 	"github.com/aws/aws-sdk-go/service/kinesis/kinesisiface"
 
@@ -79,8 +78,39 @@ type ShardConsumer struct {
 	kclConfig       *config.KinesisClientLibConfiguration
 	stop            *chan struct{}
 	consumerID      string
+	consumerARN     *string
 	mService        metrics.MonitoringService
 	state           ShardConsumerState
+}
+
+func (sc *ShardConsumer) getStartPosition(shard *par.ShardStatus) (*kinesis.StartingPosition, error) {
+	//log := sc.kclConfig.Logger
+
+	err := sc.checkpointer.FetchCheckpoint(shard)
+	if err != nil && err != chk.ErrSequenceIDNotFound {
+		return nil, err
+	}
+
+	if shard.Checkpoint == "" {
+		initPos := sc.kclConfig.InitialPositionInStream
+		shardIteratorType := config.InitalPositionInStreamToShardIteratorType(initPos)
+
+		if initPos == config.AT_TIMESTAMP {
+			return &kinesis.StartingPosition{
+				Timestamp: sc.kclConfig.InitialPositionInStreamExtended.Timestamp,
+				Type:      aws.String(kinesis.ShardIteratorTypeAtTimestamp),
+			}, nil
+		} else {
+			return &kinesis.StartingPosition{
+				Type: shardIteratorType,
+			}, nil
+		}
+	}
+
+	return &kinesis.StartingPosition{
+		SequenceNumber: aws.String(shard.Checkpoint),
+		Type:           aws.String(kinesis.ShardIteratorTypeAfterSequenceNumber),
+	}, nil
 }
 
 func (sc *ShardConsumer) getShardIterator(shard *par.ShardStatus) (*string, error) {
@@ -152,7 +182,7 @@ func (sc *ShardConsumer) getRecords(shard *par.ShardStatus) error {
 		}
 	}
 
-	shardIterator, err := sc.getShardIterator(shard)
+	startPosition, err := sc.getStartPosition(shard)
 	if err != nil {
 		log.Errorf("Unable to get shard iterator for %s: %v", shard.ID, err)
 		return err
@@ -166,109 +196,151 @@ func (sc *ShardConsumer) getRecords(shard *par.ShardStatus) error {
 	sc.recordProcessor.Initialize(input)
 
 	recordCheckpointer := NewRecordProcessorCheckpoint(shard, sc.checkpointer)
-	retriedErrors := 0
 
-	for {
-		if time.Now().UTC().After(shard.LeaseTimeout.Add(-time.Duration(sc.kclConfig.LeaseRefreshPeriodMillis) * time.Millisecond)) {
-			log.Debugf("Refreshing lease on shard: %s for worker: %s", shard.ID, sc.consumerID)
-			err = sc.checkpointer.GetLease(shard, sc.consumerID)
+	//retriedErrors := 0
+	//getRecordsStartTime := time.Now()
+
+	// lease keeper
+	var wg sync.WaitGroup
+	errc := make(chan error, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				log.Infof("Lease refresher for shard: %s stopped", shard.ID)
+				return
+			case <-time.After(time.Duration(sc.kclConfig.LeaseRefreshPeriodMillis) * time.Millisecond):
+				err = sc.checkpointer.GetLease(shard, sc.consumerID)
+				if err != nil {
+					errc <- err
+				}
+			}
+		}
+	}()
+
+	// record processor
+	go func() {
+		defer wg.Done()
+		for {
+			subscribeToShardInput := &kinesis.SubscribeToShardInput{
+				ConsumerARN:      sc.consumerARN,
+				ShardId:          aws.String(shard.ID),
+				StartingPosition: startPosition,
+			}
+
+			subscribeToShardOutput, err := sc.kc.SubscribeToShard(subscribeToShardInput)
+			eventStream := subscribeToShardOutput.EventStream
 			if err != nil {
-				if err.Error() == chk.ErrLeaseNotAquired {
-					log.Warnf("Failed in acquiring lease on shard: %s for worker: %s", shard.ID, sc.consumerID)
-					return nil
+				errc <- err
+				return
+			}
+			for e := range eventStream.Events() {
+
+				event := e.(*kinesis.SubscribeToShardEvent)
+				input := &kcl.ProcessRecordsInput{
+					Records:            event.Records,
+					Checkpointer:       recordCheckpointer,
+					MillisBehindLatest: aws.Int64Value(event.MillisBehindLatest),
 				}
-				// log and return error
-				log.Errorf("Error in refreshing lease on shard: %s for worker: %s. Error: %+v",
-					shard.ID, sc.consumerID, err)
-				return err
+
+				recordLength := len(input.Records)
+				recordBytes := int64(0)
+
+				for _, r := range event.Records {
+					recordBytes += int64(len(r.Data))
+				}
+
+				sc.mService.IncrRecordsProcessed(shard.ID, recordLength)
+				sc.mService.IncrBytesProcessed(shard.ID, recordBytes)
+				sc.mService.MillisBehindLatest(shard.ID, float64(*event.MillisBehindLatest))
+
+				log.Debugf("Received %d records, MillisBehindLatest: %v", recordLength, input.MillisBehindLatest)
+
+				if recordLength > 0 || sc.kclConfig.CallProcessRecordsEvenForEmptyRecordList {
+					processRecordsStartTime := time.Now()
+
+					// Delivery the events to the record processor
+					sc.recordProcessor.ProcessRecords(input)
+
+					// Convert from nanoseconds to milliseconds
+					processedRecordsTiming := time.Since(processRecordsStartTime) / 1000000
+					sc.mService.RecordProcessRecordsTime(shard.ID, float64(processedRecordsTiming))
+				}
+
+				if event.ContinuationSequenceNumber == nil { // this shard ends
+					log.Infof("Shard %s closed", shard.ID)
+					shutdownInput := &kcl.ShutdownInput{ShutdownReason: kcl.TERMINATE, Checkpointer: recordCheckpointer}
+					sc.recordProcessor.Shutdown(shutdownInput)
+					errc <- nil
+					return
+				}
+
+				startPosition.Type = aws.String(kinesis.ShardIteratorTypeAfterSequenceNumber)
+				startPosition.SequenceNumber = event.ContinuationSequenceNumber
+
+				select {
+				case <-ctx.Done():
+					log.Infof("Record processor for shard: %s stopped", shard.ID)
+					return
+				default:
+				}
 			}
 		}
+	}()
 
-		getRecordsStartTime := time.Now()
+	select {
+	case <-*sc.stop:
+		cancel()
+		wg.Wait()
 
-		log.Debugf("Trying to read %d record from iterator: %v", sc.kclConfig.MaxRecords, aws.StringValue(shardIterator))
-		getRecordsArgs := &kinesis.GetRecordsInput{
-			Limit:         aws.Int64(int64(sc.kclConfig.MaxRecords)),
-			ShardIterator: shardIterator,
-		}
-		// Get records from stream and retry as needed
-		getResp, err := sc.kc.GetRecords(getRecordsArgs)
-		if err != nil {
-			if awsErr, ok := err.(awserr.Error); ok {
-				if awsErr.Code() == kinesis.ErrCodeProvisionedThroughputExceededException || awsErr.Code() == ErrCodeKMSThrottlingException {
-					log.Errorf("Error getting records from shard %v: %+v", shard.ID, err)
-					retriedErrors++
-					// exponential backoff
-					// https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Programming.Errors.html#Programming.Errors.RetryAndBackoff
-					time.Sleep(time.Duration(math.Exp2(float64(retriedErrors))*100) * time.Millisecond)
-					continue
-				}
-			}
-			log.Errorf("Error getting records from Kinesis that cannot be retried: %+v Request: %s", err, getRecordsArgs)
-			return err
-		}
+	case err = <-errc:
+		cancel()
+		wg.Wait()
 
-		// Convert from nanoseconds to milliseconds
-		getRecordsTime := time.Since(getRecordsStartTime) / 1000000
-		sc.mService.RecordGetRecordsTime(shard.ID, float64(getRecordsTime))
-
-		// reset the retry count after success
-		retriedErrors = 0
-
-		// IRecordProcessorCheckpointer
-		input := &kcl.ProcessRecordsInput{
-			Records:            getResp.Records,
-			MillisBehindLatest: aws.Int64Value(getResp.MillisBehindLatest),
-			Checkpointer:       recordCheckpointer,
-		}
-
-		recordLength := len(input.Records)
-		recordBytes := int64(0)
-		log.Debugf("Received %d records, MillisBehindLatest: %v", recordLength, input.MillisBehindLatest)
-
-		for _, r := range getResp.Records {
-			recordBytes += int64(len(r.Data))
-		}
-
-		if recordLength > 0 || sc.kclConfig.CallProcessRecordsEvenForEmptyRecordList {
-			processRecordsStartTime := time.Now()
-
-			// Delivery the events to the record processor
-			sc.recordProcessor.ProcessRecords(input)
-
-			// Convert from nanoseconds to milliseconds
-			processedRecordsTiming := time.Since(processRecordsStartTime) / 1000000
-			sc.mService.RecordProcessRecordsTime(shard.ID, float64(processedRecordsTiming))
-		}
-
-		sc.mService.IncrRecordsProcessed(shard.ID, recordLength)
-		sc.mService.IncrBytesProcessed(shard.ID, recordBytes)
-		sc.mService.MillisBehindLatest(shard.ID, float64(*getResp.MillisBehindLatest))
-
-		// Idle between each read, the user is responsible for checkpoint the progress
-		// This value is only used when no records are returned; if records are returned, it should immediately
-		// retrieve the next set of records.
-		if recordLength == 0 && aws.Int64Value(getResp.MillisBehindLatest) < int64(sc.kclConfig.IdleTimeBetweenReadsInMillis) {
-			time.Sleep(time.Duration(sc.kclConfig.IdleTimeBetweenReadsInMillis) * time.Millisecond)
-		}
-
-		// The shard has been closed, so no new records can be read from it
-		if getResp.NextShardIterator == nil {
-			log.Infof("Shard %s closed", shard.ID)
-			shutdownInput := &kcl.ShutdownInput{ShutdownReason: kcl.TERMINATE, Checkpointer: recordCheckpointer}
-			sc.recordProcessor.Shutdown(shutdownInput)
+		switch {
+		case err == nil:
 			return nil
-		}
-		shardIterator = getResp.NextShardIterator
-
-		select {
-		case <-*sc.stop:
-			shutdownInput := &kcl.ShutdownInput{ShutdownReason: kcl.REQUESTED, Checkpointer: recordCheckpointer}
-			sc.recordProcessor.Shutdown(shutdownInput)
+		case err.Error() == chk.ErrLeaseNotAquired:
+			log.Warnf("Failed in acquiring lease on shard: %s for worker: %s", shard.ID, sc.consumerID)
 			return nil
 		default:
+			log.Errorf("Error in refreshing lease on shard: %s for worker: %s. Error: %+v",
+				shard.ID, sc.consumerID, err)
+			return err
 		}
 	}
+
+	//if err != nil {
+	//	if awsErr, ok := err.(awserr.Error); ok {
+	//		if awsErr.Code() == kinesis.ErrCodeProvisionedThroughputExceededException || awsErr.Code() == ErrCodeKMSThrottlingException {
+	//			log.Errorf("Error getting records from shard %v: %+v", shard.ID, err)
+	//			retriedErrors++
+	//			// exponential backoff
+	//			// https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Programming.Errors.html#Programming.Errors.RetryAndBackoff
+	//			time.Sleep(time.Duration(math.Exp2(float64(retriedErrors))*100) * time.Millisecond)
+	//			return err
+	//		}
+	//	}
+	//	//log.Errorf("Error getting records from Kinesis that cannot be retried: %+v Request: %s", err, getRecordsArgs)
+	//	return err
+	//}
+
+	// Convert from nanoseconds to milliseconds
+	//getRecordsTime := time.Since(getRecordsStartTime) / 1000000
+	//sc.mService.RecordGetRecordsTime(shard.ID, float64(getRecordsTime))
+
+	// reset the retry count after success
+	//retriedErrors = 0
+
+	// Idle between each read, the user is responsible for checkpoint the progress
+	// This value is only used when no records are returned; if records are returned, it should immediately
+	// retrieve the next set of records.
+	return nil
 }
 
 // Need to wait until the parent shard finished

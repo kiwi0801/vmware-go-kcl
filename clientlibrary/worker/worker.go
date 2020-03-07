@@ -51,10 +51,11 @@ import (
  * the shards).
  */
 type Worker struct {
-	streamName string
-	regionName string
-	workerID   string
-
+	applicationName  string
+	streamName       string
+	regionName       string
+	workerID         string
+	consumerARN      *string
 	processorFactory kcl.IRecordProcessorFactory
 	kclConfig        *config.KinesisClientLibConfiguration
 	kc               kinesisiface.KinesisAPI
@@ -82,6 +83,7 @@ func NewWorker(factory kcl.IRecordProcessorFactory, kclConfig *config.KinesisCli
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	return &Worker{
+		applicationName:  kclConfig.ApplicationName,
 		streamName:       kclConfig.StreamName,
 		regionName:       kclConfig.RegionName,
 		workerID:         kclConfig.WorkerID,
@@ -187,6 +189,39 @@ func (w *Worker) initialize() error {
 		log.Infof("Use custom Kinesis service.")
 	}
 
+	// init consumerARN
+	describeStreamOutput, err := w.kc.DescribeStream(&kinesis.DescribeStreamInput{
+		StreamName: aws.String(w.streamName),
+	})
+
+	if err != nil {
+		return err
+	}
+
+	describeStreamConsumerOutput, err := w.kc.DescribeStreamConsumer(&kinesis.DescribeStreamConsumerInput{
+		ConsumerName: aws.String(w.applicationName),
+		StreamARN:    describeStreamOutput.StreamDescription.StreamARN,
+	})
+
+	if err != nil {
+		switch err.(type) {
+		case *kinesis.ResourceNotFoundException:
+			registerConsumerOutput, err := w.kc.RegisterStreamConsumer(&kinesis.RegisterStreamConsumerInput{
+				ConsumerName: aws.String(w.applicationName),
+				StreamARN:    describeStreamOutput.StreamDescription.StreamARN,
+			})
+			if err != nil {
+				return err
+			}
+			w.consumerARN = registerConsumerOutput.Consumer.ConsumerARN
+		default:
+			return err
+		}
+	} else {
+		w.consumerARN = describeStreamConsumerOutput.ConsumerDescription.ConsumerARN
+	}
+
+	log.Infof("consumerARN: %s", *w.consumerARN)
 	// Create default dynamodb based checkpointer implementation
 	if w.checkpointer == nil {
 		log.Infof("Creating DynamoDB based checkpointer")
@@ -195,7 +230,7 @@ func (w *Worker) initialize() error {
 		log.Infof("Use custom checkpointer implementation.")
 	}
 
-	err := w.mService.Init(w.kclConfig.ApplicationName, w.streamName, w.workerID)
+	err = w.mService.Init(w.kclConfig.ApplicationName, w.streamName, w.workerID)
 	if err != nil {
 		log.Errorf("Failed to start monitoring service: %+v", err)
 	}
@@ -228,6 +263,7 @@ func (w *Worker) newShardConsumer(shard *par.ShardStatus) *ShardConsumer {
 		recordProcessor: w.processorFactory.CreateProcessor(),
 		kclConfig:       w.kclConfig,
 		consumerID:      w.workerID,
+		consumerARN:     w.consumerARN,
 		stop:            w.stop,
 		mService:        w.mService,
 		state:           WAITING_ON_PARENT_SHARDS,
