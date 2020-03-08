@@ -1,0 +1,3 @@
+{"level":"info","ts":"2019-11-21T11:07:12.625+0800","caller":"testing/testing.go:909","msg":"Zap is awesome","key1":"value1"}
+time="2019-11-21T11:07:12+08:00" level=debug msg="Starting with logrus" key1=value1
+time="2019-11-21T11:07:12+08:00" level=info msg="Logrus is awesome" key1=value1
