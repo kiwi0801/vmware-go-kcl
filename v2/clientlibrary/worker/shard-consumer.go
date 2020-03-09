@@ -327,16 +327,6 @@ func (sc *ShardConsumer) getRecords(shard *par.ShardStatus) error {
 		}
 	}
 
-	// Convert from nanoseconds to milliseconds
-	//getRecordsTime := time.Since(getRecordsStartTime) / 1000000
-	//sc.mService.RecordGetRecordsTime(shard.ID, float64(getRecordsTime))
-
-	// reset the retry count after success
-	//retriedErrors = 0
-
-	// Idle between each read, the user is responsible for checkpoint the progress
-	// This value is only used when no records are returned; if records are returned, it should immediately
-	// retrieve the next set of records.
 	return nil
 }
 
