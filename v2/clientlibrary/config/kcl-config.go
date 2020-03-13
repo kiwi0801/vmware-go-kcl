@@ -73,6 +73,7 @@ func NewKinesisClientLibConfigWithCredentials(applicationName, streamName, regio
 		KinesisCredentials:                               kiniesisCreds,
 		DynamoDBCredentials:                              dynamodbCreds,
 		TableName:                                        applicationName,
+		ConsumerName:                                     applicationName,
 		StreamName:                                       streamName,
 		RegionName:                                       regionName,
 		WorkerID:                                         workerID,
@@ -146,17 +147,17 @@ func (c *KinesisClientLibConfiguration) WithShardSyncIntervalMillis(shardSyncInt
 	return c
 }
 
-func (c *KinesisClientLibConfiguration) WithMaxRecords(maxRecords int) *KinesisClientLibConfiguration {
-	checkIsValuePositive("MaxRecords", maxRecords)
-	c.MaxRecords = maxRecords
-	return c
-}
-
 // WithMaxLeasesForWorker configures maximum lease this worker can handles. It determines how maximun number of shards
 // this worker can handle.
 func (c *KinesisClientLibConfiguration) WithMaxLeasesForWorker(n int) *KinesisClientLibConfiguration {
 	checkIsValuePositive("MaxLeasesForWorker", n)
 	c.MaxLeasesForWorker = n
+	return c
+}
+
+// WithConsumerName configures consumer name for kcl 2.0 (should be unique per shard)
+func (c *KinesisClientLibConfiguration) WithConsumerName(consumerName string) *KinesisClientLibConfiguration {
+	c.ConsumerName = consumerName
 	return c
 }
 

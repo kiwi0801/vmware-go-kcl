@@ -178,6 +178,9 @@ type (
 		// StreamName is the name of Kinesis stream
 		StreamName string
 
+		// ConsumerName is the name of Kinesis consumer name (unique in each shard)
+		ConsumerName string
+
 		// WorkerID used to distinguish different workers/processes of a Kinesis application
 		WorkerID string
 

@@ -55,6 +55,7 @@ type Worker struct {
 	streamName       string
 	regionName       string
 	workerID         string
+	consumerName     string
 	consumerARN      *string
 	processorFactory kcl.IRecordProcessorFactory
 	kclConfig        *config.KinesisClientLibConfiguration
@@ -86,6 +87,7 @@ func NewWorker(factory kcl.IRecordProcessorFactory, kclConfig *config.KinesisCli
 		applicationName:  kclConfig.ApplicationName,
 		streamName:       kclConfig.StreamName,
 		regionName:       kclConfig.RegionName,
+		consumerName:     kclConfig.ConsumerName,
 		workerID:         kclConfig.WorkerID,
 		processorFactory: factory,
 		kclConfig:        kclConfig,
@@ -199,7 +201,7 @@ func (w *Worker) initialize() error {
 	}
 
 	describeStreamConsumerOutput, err := w.kc.DescribeStreamConsumer(&kinesis.DescribeStreamConsumerInput{
-		ConsumerName: aws.String(w.applicationName),
+		ConsumerName: aws.String(w.consumerName),
 		StreamARN:    describeStreamOutput.StreamDescription.StreamARN,
 	})
 
@@ -207,7 +209,7 @@ func (w *Worker) initialize() error {
 		switch err.(type) {
 		case *kinesis.ResourceNotFoundException:
 			registerConsumerOutput, err := w.kc.RegisterStreamConsumer(&kinesis.RegisterStreamConsumerInput{
-				ConsumerName: aws.String(w.applicationName),
+				ConsumerName: aws.String(w.consumerName),
 				StreamARN:    describeStreamOutput.StreamDescription.StreamARN,
 			})
 			if err != nil {
