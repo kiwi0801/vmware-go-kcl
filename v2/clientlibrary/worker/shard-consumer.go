@@ -286,6 +286,7 @@ func (sc *ShardConsumer) getRecords(shard *par.ShardStatus) error {
 
 				if event.ContinuationSequenceNumber == nil { // this shard ends
 					log.Infof("Shard %s closed", shard.ID)
+					eventStream.Close()
 					shutdownInput := &kcl.ShutdownInput{ShutdownReason: kcl.TERMINATE, Checkpointer: recordCheckpointer}
 					sc.recordProcessor.Shutdown(shutdownInput)
 					errc <- nil
@@ -298,6 +299,7 @@ func (sc *ShardConsumer) getRecords(shard *par.ShardStatus) error {
 				select {
 				case <-ctx.Done():
 					log.Infof("Record processor for shard: %s stopped", shard.ID)
+					eventStream.Close()
 					return
 				default:
 				}
