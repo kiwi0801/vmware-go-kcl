@@ -30,6 +30,7 @@ package worker
 import (
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -276,6 +277,8 @@ func (w *Worker) eventLoop() {
 	log := w.kclConfig.Logger
 
 	var foundShards int
+	var counter int32
+
 	for {
 		// Add [-50%, +50%] random jitter to ShardSyncIntervalMillis. When multiple workers
 		// starts at the same time, this decreases the probability of them calling
@@ -283,72 +286,76 @@ func (w *Worker) eventLoop() {
 		// On average the period remains the same so that doesn't affect behavior.
 		shardSyncSleep := w.kclConfig.ShardSyncIntervalMillis/2 + w.rng.Intn(int(w.kclConfig.ShardSyncIntervalMillis))
 
-		err := w.syncShard()
-		if err != nil {
-			log.Errorf("Error syncing shards: %+v, Retrying in %d ms...", err, shardSyncSleep)
-			time.Sleep(time.Duration(shardSyncSleep) * time.Millisecond)
-			continue
-		}
-
-		if foundShards == 0 || foundShards != len(w.shardStatus) {
-			foundShards = len(w.shardStatus)
-			log.Infof("Found %d shards", foundShards)
-		}
-
-		// Count the number of leases hold by this worker excluding the processed shard
-		counter := 0
-		for _, shard := range w.shardStatus {
-			if shard.GetLeaseOwner() == w.workerID && shard.Checkpoint != chk.SHARD_END {
-				counter++
+		if int(counter) < w.kclConfig.MaxLeasesForWorker {
+			err := w.syncShard()
+			if err != nil {
+				log.Errorf("Error syncing shards: %+v, Retrying in %d ms...", err, shardSyncSleep)
+				time.Sleep(time.Duration(shardSyncSleep) * time.Millisecond)
+				continue
 			}
-		}
 
-		// max number of lease has not been reached yet
-		if counter < w.kclConfig.MaxLeasesForWorker {
+			if foundShards == 0 || foundShards != len(w.shardStatus) {
+				foundShards = len(w.shardStatus)
+				log.Infof("Found %d shards", foundShards)
+			}
+
+			// Count the number of leases hold by this worker excluding the processed shard
+			counter = 0
 			for _, shard := range w.shardStatus {
-				// already owner of the shard
-				if shard.GetLeaseOwner() == w.workerID {
-					continue
+				if shard.GetLeaseOwner() == w.workerID && shard.Checkpoint != chk.SHARD_END {
+					counter++
 				}
+			}
 
-				err := w.checkpointer.FetchCheckpoint(shard)
-				if err != nil {
-					// checkpoint may not existed yet is not an error condition.
-					if err != chk.ErrSequenceIDNotFound {
-						log.Errorf(" Error: %+v", err)
-						// move on to next shard
+			// max number of lease has not been reached yet
+			if int(counter) < w.kclConfig.MaxLeasesForWorker {
+				for _, shard := range w.shardStatus {
+					// already owner of the shard
+					if shard.GetLeaseOwner() == w.workerID {
 						continue
 					}
-				}
 
-				// The shard is closed and we have processed all records
-				if shard.Checkpoint == chk.SHARD_END {
-					continue
-				}
-
-				err = w.checkpointer.GetLease(shard, w.workerID)
-				if err != nil {
-					// cannot get lease on the shard
-					if err.Error() != chk.ErrLeaseNotAquired {
-						log.Errorf("Cannot get lease: %+v", err)
+					err := w.checkpointer.FetchCheckpoint(shard)
+					if err != nil {
+						// checkpoint may not existed yet is not an error condition.
+						if err != chk.ErrSequenceIDNotFound {
+							log.Errorf(" Error: %+v", err)
+							// move on to next shard
+							continue
+						}
 					}
-					continue
-				}
 
-				// log metrics on got lease
-				w.mService.LeaseGained(shard.ID)
-
-				log.Infof("Start Shard Consumer for shard: %v", shard.ID)
-				sc := w.newShardConsumer(shard)
-				w.waitGroup.Add(1)
-				go func() {
-					defer w.waitGroup.Done()
-					if err := sc.getRecords(shard); err != nil {
-						log.Errorf("Error in getRecords: %+v", err)
+					// The shard is closed and we have processed all records
+					if shard.Checkpoint == chk.SHARD_END {
+						continue
 					}
-				}()
-				// exit from for loop and not to grab more shard for now.
-				break
+
+					err = w.checkpointer.GetLease(shard, w.workerID)
+					if err != nil {
+						// cannot get lease on the shard
+						if err.Error() != chk.ErrLeaseNotAquired {
+							log.Errorf("Cannot get lease: %+v", err)
+						}
+						continue
+					}
+
+					counter++
+					// log metrics on got lease
+					w.mService.LeaseGained(shard.ID)
+
+					log.Infof("Start Shard Consumer for shard: %v", shard.ID)
+					sc := w.newShardConsumer(shard)
+					w.waitGroup.Add(1)
+					go func() {
+						defer w.waitGroup.Done()
+						defer atomic.AddInt32(&counter, -1)
+						if err := sc.getRecords(shard); err != nil {
+							log.Errorf("Error in getRecords: %+v", err)
+						}
+					}()
+					// exit from for loop and not to grab more shard for now.
+					break
+				}
 			}
 		}
 
