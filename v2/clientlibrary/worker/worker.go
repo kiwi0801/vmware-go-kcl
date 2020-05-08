@@ -287,6 +287,7 @@ func (w *Worker) eventLoop() {
 		shardSyncSleep := w.kclConfig.ShardSyncIntervalMillis/2 + w.rng.Intn(int(w.kclConfig.ShardSyncIntervalMillis))
 
 		if int(counter) < w.kclConfig.MaxLeasesForWorker {
+			log.Infof("[DEBUG] Sync shard... %d", counter)
 			err := w.syncShard()
 			if err != nil {
 				log.Errorf("Error syncing shards: %+v, Retrying in %d ms...", err, shardSyncSleep)
@@ -354,7 +355,9 @@ func (w *Worker) eventLoop() {
 						}
 					}()
 					// exit from for loop and not to grab more shard for now.
-					break
+					if int(counter) >= w.kclConfig.MaxLeasesForWorker {
+						break
+					}
 				}
 			}
 		}
