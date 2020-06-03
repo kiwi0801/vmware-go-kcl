@@ -303,12 +303,12 @@ func (w *Worker) eventLoop() {
 			counter = 0
 			for _, shard := range w.shardStatus {
 				if shard.GetLeaseOwner() == w.workerID && shard.Checkpoint != chk.SHARD_END {
-					counter++
+					atomic.AddInt32(&counter, 1)
 				}
 			}
 
 			// max number of lease has not been reached yet
-			if int(counter) < w.kclConfig.MaxLeasesForWorker {
+			if int(atomic.LoadInt32(&counter)) < w.kclConfig.MaxLeasesForWorker {
 				for _, shard := range w.shardStatus {
 					// already owner of the shard
 					if shard.GetLeaseOwner() == w.workerID {
@@ -339,7 +339,7 @@ func (w *Worker) eventLoop() {
 						continue
 					}
 
-					counter++
+					atomic.AddInt32(&counter, 1)
 					// log metrics on got lease
 					w.mService.LeaseGained(shard.ID)
 
