@@ -30,7 +30,6 @@ package worker
 import (
 	"math/rand"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -276,17 +275,17 @@ func (w *Worker) newShardConsumer(shard *par.ShardStatus) *ShardConsumer {
 func (w *Worker) eventLoop() {
 	log := w.kclConfig.Logger
 
-	var foundShards int
-	var counter int32
+	var foundShards, counter int
+	exitCh := make(chan struct{}, 1)
 
 	for {
 		// Add [-50%, +50%] random jitter to ShardSyncIntervalMillis. When multiple workers
 		// starts at the same time, this decreases the probability of them calling
 		// kinesis.DescribeStream at the same time, and hit the hard-limit on aws API calls.
 		// On average the period remains the same so that doesn't affect behavior.
-		shardSyncSleep := w.kclConfig.ShardSyncIntervalMillis/2 + w.rng.Intn(int(w.kclConfig.ShardSyncIntervalMillis))
+		shardSyncSleep := w.kclConfig.ShardSyncIntervalMillis/2 + w.rng.Intn(w.kclConfig.ShardSyncIntervalMillis)
 
-		if int(counter) < w.kclConfig.MaxLeasesForWorker {
+		if counter < w.kclConfig.MaxLeasesForWorker {
 			err := w.syncShard()
 			if err != nil {
 				log.Errorf("Error syncing shards: %+v, Retrying in %d ms...", err, shardSyncSleep)
@@ -300,15 +299,16 @@ func (w *Worker) eventLoop() {
 			}
 
 			// Count the number of leases hold by this worker excluding the processed shard
+			//var counter int32
 			counter = 0
 			for _, shard := range w.shardStatus {
 				if shard.GetLeaseOwner() == w.workerID && shard.Checkpoint != chk.SHARD_END {
-					atomic.AddInt32(&counter, 1)
+					counter++
 				}
 			}
 
 			// max number of lease has not been reached yet
-			if int(atomic.LoadInt32(&counter)) < w.kclConfig.MaxLeasesForWorker {
+			if counter < w.kclConfig.MaxLeasesForWorker {
 				for _, shard := range w.shardStatus {
 					// already owner of the shard
 					if shard.GetLeaseOwner() == w.workerID {
@@ -339,7 +339,7 @@ func (w *Worker) eventLoop() {
 						continue
 					}
 
-					atomic.AddInt32(&counter, 1)
+					counter++
 					// log metrics on got lease
 					w.mService.LeaseGained(shard.ID)
 
@@ -348,10 +348,10 @@ func (w *Worker) eventLoop() {
 					w.waitGroup.Add(1)
 					go func() {
 						defer w.waitGroup.Done()
-						defer atomic.AddInt32(&counter, -1)
 						if err := sc.getRecords(shard); err != nil {
 							log.Errorf("Error in getRecords: %+v", err)
 						}
+						exitCh <- struct{}{}
 					}()
 					// exit from for loop and not to grab more shard for now.
 					break
@@ -363,6 +363,8 @@ func (w *Worker) eventLoop() {
 		case <-*w.stop:
 			log.Infof("Shutting down...")
 			return
+		case <-exitCh:
+			counter--
 		case <-time.After(time.Duration(shardSyncSleep) * time.Millisecond):
 			log.Debugf("Waited %d ms to sync shards...", shardSyncSleep)
 		}
