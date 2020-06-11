@@ -236,7 +236,7 @@ func (sc *ShardConsumer) getRecords(shard *par.ShardStatus) error {
 			subscribeToShardOutput, err := sc.kc.SubscribeToShard(subscribeToShardInput)
 			if err != nil {
 				switch err.(type) {
-				case *kinesis.LimitExceededException, *kinesis.ResourceInUseException:
+				case *kinesis.LimitExceededException:
 					log.Errorf("Error getting records from shard %v: %+v", shard.ID, err)
 					retriedErrors++
 					time.Sleep(time.Duration(math.Exp2(float64(retriedErrors))*100) * time.Millisecond)
