@@ -371,4 +371,7 @@ func (sc *ShardConsumer) releaseLease(shard *par.ShardStatus) {
 
 	// reporting lease lose metrics
 	sc.mService.LeaseLost(shard.ID)
+
+	// set this to zero to reduce the noise
+	sc.mService.MillisBehindLatest(shard.ID, 0)
 }
