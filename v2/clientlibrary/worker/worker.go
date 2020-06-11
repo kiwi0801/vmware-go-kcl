@@ -283,7 +283,6 @@ func (w *Worker) eventLoop() {
 		// On average the period remains the same so that doesn't affect behavior.
 		shardSyncSleep := w.kclConfig.ShardSyncIntervalMillis/2 + w.rng.Intn(w.kclConfig.ShardSyncIntervalMillis)
 
-		//if counter < w.kclConfig.MaxLeasesForWorker {
 		err := w.syncShard()
 		if err != nil {
 			log.Errorf("Error syncing shards: %+v, Retrying in %d ms...", err, shardSyncSleep)
@@ -340,7 +339,7 @@ func (w *Worker) eventLoop() {
 				// log metrics on got lease
 				w.mService.LeaseGained(shard.ID)
 
-				log.Infof("Start Shard Consumer for shard: %v", shard.ID)
+				log.Infof("Start Shard Consumer for shard: %v for worker: %v", shard.ID, w.workerID)
 				sc := w.newShardConsumer(shard)
 				w.waitGroup.Add(1)
 				go func() {
@@ -353,7 +352,6 @@ func (w *Worker) eventLoop() {
 				break
 			}
 		}
-		//}
 
 		select {
 		case <-*w.stop:
