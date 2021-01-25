@@ -338,16 +338,15 @@ func (w *Worker) eventLoop() {
 
 				// log metrics on got lease
 				w.mService.LeaseGained(shard.ID)
-
-				log.Infof("Start Shard Consumer for shard: %v for worker: %v", shard.ID, w.workerID)
-				sc := w.newShardConsumer(shard)
 				w.waitGroup.Add(1)
-				go func() {
+				go func(shard *par.ShardStatus) {
 					defer w.waitGroup.Done()
+					log.Infof("Start Shard Consumer for shard: %v for worker: %v", shard.ID, w.workerID)
+					sc := w.newShardConsumer(shard)
 					if err := sc.getRecords(shard); err != nil {
 						log.Errorf("Error in getRecords: %+v", err)
 					}
-				}()
+				}(shard)
 				// exit from for loop and not to grab more shard for now.
 				break
 			}
