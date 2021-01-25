@@ -255,10 +255,9 @@ func (sc *ShardConsumer) getRecords(shard *par.ShardStatus) error {
 		eventLoop:
 			for {
 				select {
-				case e := <-events:
-					if e == nil {
-						log.Infof("recv nil event")
-						continue
+				case e, ok := <-events:
+					if !ok { // channel closed by kinesis
+						break eventLoop
 					}
 					event := e.(*kinesis.SubscribeToShardEvent)
 					input := &kcl.ProcessRecordsInput{
