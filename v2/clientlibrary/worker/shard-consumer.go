@@ -30,6 +30,7 @@ package worker
 import (
 	"context"
 	"math"
+	"reflect"
 	"sync"
 	"time"
 
@@ -256,7 +257,11 @@ func (sc *ShardConsumer) getRecords(shard *par.ShardStatus) error {
 			for {
 				select {
 				case e := <-events:
-					event := e.(*kinesis.SubscribeToShardEvent)
+					event, ok := e.(*kinesis.SubscribeToShardEvent)
+					if !ok {
+						log.Infof("get strange shardEvent type: %v", reflect.TypeOf(e).String())
+						continue
+					}
 					input := &kcl.ProcessRecordsInput{
 						Records:            event.Records,
 						Checkpointer:       recordCheckpointer,
