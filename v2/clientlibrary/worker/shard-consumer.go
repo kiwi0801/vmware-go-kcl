@@ -307,6 +307,7 @@ func (sc *ShardConsumer) getRecords(shard *par.ShardStatus) error {
 					}
 				case <-time.After(5 * time.Minute):
 					log.Infof("Resubscribing... no message for 5 minutes , shard: %s", shard.ID)
+					eventStream.Close()
 					break eventLoop
 				}
 			}
