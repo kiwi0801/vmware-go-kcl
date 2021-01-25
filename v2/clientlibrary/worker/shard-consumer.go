@@ -251,57 +251,63 @@ func (sc *ShardConsumer) getRecords(shard *par.ShardStatus) error {
 			sc.mService.RecordGetRecordsTime(shard.ID, float64(subscribeToShardTime))
 
 			eventStream := subscribeToShardOutput.EventStream
-			for e := range eventStream.Events() {
-
-				event := e.(*kinesis.SubscribeToShardEvent)
-				input := &kcl.ProcessRecordsInput{
-					Records:            event.Records,
-					Checkpointer:       recordCheckpointer,
-					MillisBehindLatest: aws.Int64Value(event.MillisBehindLatest),
-				}
-
-				recordLength := len(input.Records)
-				recordBytes := int64(0)
-
-				for _, r := range event.Records {
-					recordBytes += int64(len(r.Data))
-				}
-
-				sc.mService.IncrRecordsProcessed(shard.ID, recordLength)
-				sc.mService.IncrBytesProcessed(shard.ID, recordBytes)
-				sc.mService.MillisBehindLatest(shard.ID, float64(*event.MillisBehindLatest))
-
-				log.Debugf("Received %d records, MillisBehindLatest: %v", recordLength, input.MillisBehindLatest)
-
-				if recordLength > 0 || sc.kclConfig.CallProcessRecordsEvenForEmptyRecordList {
-					processRecordsStartTime := time.Now()
-
-					// Delivery the events to the record processor
-					sc.recordProcessor.ProcessRecords(input)
-
-					// Convert from nanoseconds to milliseconds
-					processedRecordsTiming := time.Since(processRecordsStartTime) / 1000000
-					sc.mService.RecordProcessRecordsTime(shard.ID, float64(processedRecordsTiming))
-				}
-
-				if event.ContinuationSequenceNumber == nil { // this shard ends
-					log.Infof("Shard %s closed", shard.ID)
-					eventStream.Close()
-					shutdownInput := &kcl.ShutdownInput{ShutdownReason: kcl.TERMINATE, Checkpointer: recordCheckpointer}
-					sc.recordProcessor.Shutdown(shutdownInput)
-					errc <- nil
-					return
-				}
-
-				startPosition.Type = aws.String(kinesis.ShardIteratorTypeAfterSequenceNumber)
-				startPosition.SequenceNumber = event.ContinuationSequenceNumber
-
+			events := eventStream.Events()
+		eventLoop:
+			for {
 				select {
-				case <-ctx.Done():
-					log.Infof("Record processor for shard: %s stopped", shard.ID)
-					eventStream.Close()
-					return
-				default:
+				case e := <-events:
+					event := e.(*kinesis.SubscribeToShardEvent)
+					input := &kcl.ProcessRecordsInput{
+						Records:            event.Records,
+						Checkpointer:       recordCheckpointer,
+						MillisBehindLatest: aws.Int64Value(event.MillisBehindLatest),
+					}
+					recordLength := len(input.Records)
+					recordBytes := int64(0)
+
+					for _, r := range event.Records {
+						recordBytes += int64(len(r.Data))
+					}
+
+					sc.mService.IncrRecordsProcessed(shard.ID, recordLength)
+					sc.mService.IncrBytesProcessed(shard.ID, recordBytes)
+					sc.mService.MillisBehindLatest(shard.ID, float64(*event.MillisBehindLatest))
+
+					log.Debugf("Received %d records, MillisBehindLatest: %v", recordLength, input.MillisBehindLatest)
+
+					if recordLength > 0 || sc.kclConfig.CallProcessRecordsEvenForEmptyRecordList {
+						processRecordsStartTime := time.Now()
+
+						// Delivery the events to the record processor
+						sc.recordProcessor.ProcessRecords(input)
+
+						// Convert from nanoseconds to milliseconds
+						processedRecordsTiming := time.Since(processRecordsStartTime) / 1000000
+						sc.mService.RecordProcessRecordsTime(shard.ID, float64(processedRecordsTiming))
+					}
+
+					if event.ContinuationSequenceNumber == nil { // this shard ends
+						log.Infof("Shard %s closed", shard.ID)
+						eventStream.Close()
+						shutdownInput := &kcl.ShutdownInput{ShutdownReason: kcl.TERMINATE, Checkpointer: recordCheckpointer}
+						sc.recordProcessor.Shutdown(shutdownInput)
+						errc <- nil
+						return
+					}
+
+					startPosition.Type = aws.String(kinesis.ShardIteratorTypeAfterSequenceNumber)
+					startPosition.SequenceNumber = event.ContinuationSequenceNumber
+
+					select {
+					case <-ctx.Done():
+						log.Infof("Record processor for shard: %s stopped", shard.ID)
+						eventStream.Close()
+						return
+					default:
+					}
+				case <-time.After(5 * time.Minute):
+					log.Infof("Resubscribing... no message for 5 minutes , shard: %s", shard.ID)
+					break eventLoop
 				}
 			}
 		}
@@ -312,7 +318,7 @@ func (sc *ShardConsumer) getRecords(shard *par.ShardStatus) error {
 		cancel()
 		wg.Wait()
 
-	case err = <-errc:
+	case err = <-errc: // error will be from leaser or subscriber
 		cancel()
 		wg.Wait()
 
