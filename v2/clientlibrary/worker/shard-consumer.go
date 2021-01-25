@@ -257,6 +257,7 @@ func (sc *ShardConsumer) getRecords(shard *par.ShardStatus) error {
 				select {
 				case e, ok := <-events:
 					if !ok { // channel closed by kinesis
+						eventStream.Close()
 						break eventLoop
 					}
 					event := e.(*kinesis.SubscribeToShardEvent)
