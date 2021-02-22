@@ -207,12 +207,16 @@ func (sc *ShardConsumer) getRecords(shard *par.ShardStatus) error {
 
 	go func() {
 		defer wg.Done()
+		d := time.Duration(sc.kclConfig.LeaseRefreshPeriodMillis) * time.Millisecond
+		timer := time.NewTimer(d)
+		defer timer.Stop()
 		for {
+			timer.Reset(d)
 			select {
 			case <-ctx.Done():
 				log.Infof("Lease refresher for shard: %s stopped", shard.ID)
 				return
-			case <-time.After(time.Duration(sc.kclConfig.LeaseRefreshPeriodMillis) * time.Millisecond):
+			case <-timer.C:
 				err = sc.checkpointer.GetLease(shard, sc.consumerID)
 				if err != nil {
 					errc <- err
@@ -252,8 +256,11 @@ func (sc *ShardConsumer) getRecords(shard *par.ShardStatus) error {
 
 			eventStream := subscribeToShardOutput.EventStream
 			events := eventStream.Events()
+			d := 5 * time.Minute
+			timer := time.NewTimer(d)
 		eventLoop:
 			for {
+				timer.Reset(d)
 				select {
 				case e, ok := <-events:
 					if !ok { // channel closed by kinesis
@@ -309,7 +316,7 @@ func (sc *ShardConsumer) getRecords(shard *par.ShardStatus) error {
 						return
 					default:
 					}
-				case <-time.After(5 * time.Minute):
+				case <-timer.C:
 					log.Infof("Resubscribing... no message for 5 minutes , shard: %s", shard.ID)
 					eventStream.Close()
 					break eventLoop
